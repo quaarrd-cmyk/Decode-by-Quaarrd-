@@ -15,6 +15,7 @@ TEXT_MODEL = "openai/gpt-oss-120b"      # reasoning / final answer
 
 def web_search(query, max_results=3):
     """Search the web with Tavily and return a short combined text summary."""
+    query = query.replace("\n", " ").strip()[:390]  # Tavily hard limit: 400 chars
     try:
         results = tavily.search(query=query, max_results=max_results)
         snippets = []
@@ -24,13 +25,26 @@ def web_search(query, max_results=3):
     except Exception as e:
         return f"(web search unavailable: {e})"
 
+
+def build_search_query(vision_output, template):
+    """Build a short, targeted search query instead of dumping the whole vision output in."""
+    lines = vision_output.splitlines()
+    brand_lines = [l.replace("BRAND:", "").strip() for l in lines if "BRAND:" in l]
+    if brand_lines:
+        key_text = " ".join(brand_lines[:2])  # use identified brand/product name(s)
+    else:
+        key_text = " ".join(lines[:3])  # fallback: first few lines only
+    return template.format(vision_output=key_text)[:390]
+
 MODES = {
     "🧾 Split It": {
         "desc": "Photo of a receipt → fair bill split",
         "vision_prompt": (
-            "Read this receipt carefully. Extract every line item with its exact "
-            "price, and the total (including tax/tip if shown). Return it as a "
-            "clean plain-text list, one item per line, then the total on its own line."
+            "You may be given one or more photos of the same receipt/bill (e.g. "
+            "multiple angles or a long receipt split across shots). Combine info "
+            "across all photos. Read carefully. Extract every line item with its "
+            "exact price, and the total (including tax/tip if shown). Return it as "
+            "a clean plain-text list, one item per line, then the total on its own line."
         ),
         "followup_label": "Who ordered what? (e.g. 'Alice: burger, fries. Bob: pizza, coke. Split shared items evenly')",
         "followup_prompt": (
@@ -44,9 +58,11 @@ MODES = {
     "🐛 Fix It": {
         "desc": "Photo/paste of a code error → plain-English fix",
         "vision_prompt": (
-            "Read this code error, stack trace, or code screenshot exactly as "
-            "written. Transcribe the exact error message (word for word) and any "
-            "visible code faithfully."
+            "You may be given one or more photos (e.g. the error plus the "
+            "relevant code, or multiple screenshots of the same issue). Combine "
+            "info across all photos. Read this code error, stack trace, or code "
+            "screenshot exactly as written. Transcribe the exact error message "
+            "(word for word) and any visible code faithfully."
         ),
         "followup_label": "Anything else about your setup? (language, what you were trying to do) — optional",
         "search_query_template": "{vision_output} fix solution",
@@ -64,11 +80,14 @@ MODES = {
     "🍳 Cook It": {
         "desc": "Photo of your fridge/pantry → a recipe from what you have",
         "vision_prompt": (
-            "Look at this photo of a fridge, pantry, or food package. List every "
-            "food ingredient or item you can identify, as a clean bullet list. "
-            "If any item has a visible brand name or product name (e.g. on a "
-            "package), state it clearly on its own line starting with 'BRAND:'. "
-            "Be specific but don't guess wildly at things you can't see clearly."
+            "You may be given one or more photos (e.g. fridge + pantry, or "
+            "several angles of the same shelf). Combine info across all photos "
+            "into one list. Look at each photo of a fridge, pantry, or food "
+            "package. List every food ingredient or item you can identify, as a "
+            "clean bullet list. If any item has a visible brand name or product "
+            "name (e.g. on a package), state it clearly on its own line starting "
+            "with 'BRAND:'. Be specific but don't guess wildly at things you "
+            "can't see clearly."
         ),
         "followup_label": "Any preferences? (e.g. vegetarian, quick meal, spicy) — optional",
         "search_query_template": "{vision_output} ingredients list nutrition facts",
@@ -91,22 +110,16 @@ def encode_image(uploaded_file):
     return base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
 
 
-def run_vision(image_b64, prompt):
+def run_vision(image_b64_list, prompt):
+    content = [{"type": "text", "text": prompt}]
+    for img_b64 in image_b64_list:
+        content.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        )
     resp = client.chat.completions.create(
         model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                ],
-            }
-        ],
-        max_tokens=1200,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=1500,
     )
     return resp.choices[0].message.content
 
@@ -133,14 +146,22 @@ mode = st.radio(
 st.divider()
 
 image_source = st.radio("Image source", ["Upload", "Camera"], horizontal=True)
-uploaded_file = (
-    st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"])
-    if image_source == "Upload"
-    else st.camera_input("Take a photo")
-)
 
-if uploaded_file:
-    st.image(uploaded_file, caption="Your photo", use_container_width=True)
+if image_source == "Upload":
+    uploaded_files = st.file_uploader(
+        "Upload one or more photos",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+    )
+else:
+    single_cam = st.camera_input("Take a photo")
+    uploaded_files = [single_cam] if single_cam else []
+
+if uploaded_files:
+    cols = st.columns(min(len(uploaded_files), 3))
+    for i, f in enumerate(uploaded_files):
+        with cols[i % len(cols)]:
+            st.image(f, caption=f"Photo {i+1}", use_container_width=True)
 
     if "vision_output" not in st.session_state:
         st.session_state.vision_output = None
@@ -149,11 +170,11 @@ if uploaded_file:
         st.session_state.last_mode = mode
 
     if st.session_state.vision_output is None:
-        if st.button("🔍 Analyze photo", type="primary"):
-            with st.spinner("Reading your photo..."):
-                image_b64 = encode_image(uploaded_file)
+        if st.button("🔍 Analyze photo(s)", type="primary"):
+            with st.spinner(f"Reading {len(uploaded_files)} photo(s)..."):
+                image_b64_list = [encode_image(f) for f in uploaded_files]
                 st.session_state.vision_output = run_vision(
-                    image_b64, MODES[mode]["vision_prompt"]
+                    image_b64_list, MODES[mode]["vision_prompt"]
                 )
             st.rerun()
 
@@ -167,11 +188,13 @@ if uploaded_file:
             search_results = "(no web search for this mode)"
             if "search_query_template" in MODES[mode]:
                 with st.spinner("Searching the web for accurate info..."):
-                    query = MODES[mode]["search_query_template"].format(
-                        vision_output=st.session_state.vision_output
+                    query = build_search_query(
+                        st.session_state.vision_output,
+                        MODES[mode]["search_query_template"],
                     )
                     search_results = web_search(query)
                 with st.expander("What the web search found", expanded=False):
+                    st.caption(f"Searched: {query}")
                     st.write(search_results)
 
             with st.spinner("Working it out..."):
